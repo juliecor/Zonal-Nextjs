@@ -1,3 +1,4 @@
 {
-    "ABRA": "/zonal/ABRA.csv"
+  "ABRA": "/zonal/ABRA.csv",
+  "ILOCOSNORTE": "/zonal/ILOCOSNORTE.csv"
 }

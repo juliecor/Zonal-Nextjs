@@ -14,9 +14,13 @@ import L, { type LeafletEventHandlerFnMap } from "leaflet";
 type LatLngTuple = [number, number];
 
 const DefaultIcon = L.icon({
-  iconUrl: "https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/images/marker-icon.png",
-  iconRetinaUrl: "https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/images/marker-icon-2x.png",
-  shadowUrl: "https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/images/marker-shadow.png",
+  // ✅ use CDN images so no /public copy needed and no 404s
+  iconUrl:
+    "https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/images/marker-icon.png",
+  iconRetinaUrl:
+    "https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/images/marker-icon-2x.png",
+  shadowUrl:
+    "https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/images/marker-shadow.png",
   iconSize: [25, 41],
   iconAnchor: [12, 41],
   popupAnchor: [1, -34],
@@ -66,7 +70,12 @@ export default function MapPanel({
   return (
     <div className="relative z-0 overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm">
       <div className="h-[70vh] w-full">
-        <MapContainer center={center} zoom={14} scrollWheelZoom className="h-full w-full">
+        <MapContainer
+          center={center}
+          zoom={14}
+          scrollWheelZoom
+          className="h-full w-full"
+        >
           <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
           <Recenter center={center} />
           <ClickPicker onPick={onPick} />

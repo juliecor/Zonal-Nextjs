@@ -44,6 +44,8 @@ type Reports = {
   transport: number;
 };
 
+type Manifest = Record<string, string>;
+
 /* ---------------- helpers ---------------- */
 
 function clsx(...parts: Array<string | false | null | undefined>) {
@@ -59,17 +61,24 @@ function norm(s: string) {
 }
 
 function parseMoney(v: string): number {
-  const cleaned = (v ?? "").toString().replace(/"/g, "").replace(/,/g, "").trim();
+  const cleaned = (v ?? "")
+    .toString()
+    .replace(/"/g, "")
+    .replace(/,/g, "")
+    .trim();
   const n = Number(cleaned);
   return Number.isFinite(n) ? n : NaN;
 }
 
 function money(n: number) {
   if (!Number.isFinite(n)) return "—";
-  return n.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return n.toLocaleString(undefined, {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  });
 }
 
-/** CSV/TSV parser (supports header or no header) */
+/** Parses both CSV and TSV, supports header or no header */
 function parseZonalFile(text: string): Row[] {
   const lines = text
     .replace(/\r/g, "")
@@ -176,6 +185,42 @@ function scoreRow(row: Row, queryText: string, hints?: { province?: string; muni
   return s;
 }
 
+/* ---------------- Province detection + normalization ---------------- */
+
+/**
+ * Nominatim PH can put "province" into different fields depending on the place.
+ * We try multiple candidates.
+ */
+function detectProvinceName(address: any): string {
+  if (!address) return "";
+  return (
+    address.province ||
+    address.state ||        // sometimes province appears here
+    address.county ||
+    address.region ||
+    ""
+  );
+}
+
+/**
+ * This MUST match your manifest keys:
+ * - removes "Province/Provincia"
+ * - removes spaces and punctuation
+ * - uppercase
+ *
+ * "Ilocos Norte Province" -> "ILOCOSNORTE"
+ * "Ilocos Norte" -> "ILOCOSNORTE"
+ */
+function normalizeProvinceKey(p?: string | null) {
+  if (!p) return "";
+  return String(p)
+    .trim()
+    .replace(/\bprovince\b/gi, "")
+    .replace(/\bprovincia\b/gi, "")
+    .replace(/[\s._-]+/g, "") // remove spaces + common separators
+    .toUpperCase();
+}
+
 /* ---------------- Nominatim ---------------- */
 
 async function nominatimSearch(q: string, limit = 5): Promise<NominatimSuggestion[]> {
@@ -214,7 +259,35 @@ async function nominatimReverse(lat: number, lng: number): Promise<Geo> {
   };
 }
 
-/* ---------------- Overpass (3 calls + fallback + caching) ---------------- */
+/* ---------------- Manifest + dataset loader ---------------- */
+
+async function fetchManifest(): Promise<Manifest> {
+  const res = await fetch("/zonal/manifest.json", { cache: "no-store" });
+  if (!res.ok) throw new Error("Failed to load /zonal/manifest.json");
+  return (await res.json()) as Manifest;
+}
+
+
+const datasetCache = new Map<string, Row[]>();
+
+async function loadProvinceRows(manifest: Manifest, provinceKey: string): Promise<Row[]> {
+  if (datasetCache.has(provinceKey)) return datasetCache.get(provinceKey)!;
+
+  const path = manifest[provinceKey];
+  if (!path) throw new Error(`No CSV mapped for province key: ${provinceKey}`);
+
+  const res = await fetch(path, { cache: "force-cache" });
+  if (!res.ok) throw new Error(`Failed to load CSV: ${path}`);
+
+  const text = await res.text();
+  const rows = parseZonalFile(text);
+  if (!rows.length) throw new Error(`Loaded ${path} but got 0 rows`);
+
+  datasetCache.set(provinceKey, rows);
+  return rows;
+}
+
+/* ---------------- Overpass (kept minimal; you already know rate limit can happen) ---------------- */
 
 const OVERPASS_ENDPOINTS = [
   "https://overpass-api.de/api/interpreter",
@@ -251,8 +324,6 @@ async function overpassWithFallback(query: string) {
       return await postOverpass(ep, query);
     } catch (e: any) {
       lastErr = e;
-      const msg = String(e?.message ?? "");
-      if (looksRateLimited(msg)) continue;
       continue;
     }
   }
@@ -278,28 +349,16 @@ async function fetchReports(lat: number, lng: number, radius: number): Promise<R
   const cached = reportsCache.get(key);
   if (cached) return cached;
 
-  const sessionKey = `reports:${key}`;
-  try {
-    const raw = sessionStorage.getItem(sessionKey);
-    if (raw) {
-      const parsed = JSON.parse(raw) as Reports;
-      reportsCache.set(key, parsed);
-      return parsed;
-    }
-  } catch {}
-
   const amenityQuery = `
 [out:json][timeout:25];
 nwr["amenity"~"^(hospital|school|police|fire_station|pharmacy|bank|marketplace)$"](around:${radius},${lat},${lng});
 out tags;
 `;
-
   const mallQuery = `
 [out:json][timeout:25];
 nwr["shop"="mall"](around:${radius},${lat},${lng});
 out tags;
 `;
-
   const transportQuery = `
 [out:json][timeout:25];
 (
@@ -347,14 +406,10 @@ out tags;
   };
 
   reportsCache.set(key, final);
-  try {
-    sessionStorage.setItem(sessionKey, JSON.stringify(final));
-  } catch {}
-
   return final;
 }
 
-/* ---------------- UI ---------------- */
+/* ---------------- UI components ---------------- */
 
 function Card({ title, children }: { title: string; children: React.ReactNode }) {
   return (
@@ -374,7 +429,7 @@ function Metric({ label, value }: { label: string; value: number | string }) {
   );
 }
 
-/* ---------------- Report modal (printable) ---------------- */
+/* ---------------- Printable report modal (simple) ---------------- */
 
 function tier(z: number) {
   if (!Number.isFinite(z) || z <= 0) return "Unknown";
@@ -392,14 +447,16 @@ function makeReport(args: {
   reports: Reports | null;
   confidence: "High" | "Medium" | "Low" | "—";
   radius: number;
+  provinceKey: string;
 }) {
-  const { placeName, lat, lng, match, reports, confidence, radius } = args;
+  const { placeName, lat, lng, match, reports, confidence, radius, provinceKey } = args;
   const created = new Date().toLocaleString();
 
   const bullets: string[] = [];
   bullets.push(`Location: ${placeName}`);
   bullets.push(`Coordinates: ${lat.toFixed(6)}, ${lng.toFixed(6)}`);
-  bullets.push(`Radius used for facility counts: ${Math.round(radius)}m`);
+  bullets.push(`Province dataset loaded: ${provinceKey || "—"}`);
+  bullets.push(`Radius used for counts: ${Math.round(radius)}m`);
 
   if (match) {
     bullets.push(`Zonal Value: ₱ ${money(match.zonalValue)} (${tier(match.zonalValue)} tier)`);
@@ -408,40 +465,37 @@ function makeReport(args: {
     bullets.push(`Vicinity: ${match.vicinity}`);
     bullets.push(`Match confidence: ${confidence}`);
   } else {
-    bullets.push(`Zonal Value: No selected record`);
+    bullets.push("Zonal Value: No selected record");
   }
 
   if (reports) {
     bullets.push(
       `Facilities: Hosp ${reports.hospitals}, Schools ${reports.schools}, Police ${reports.police}, Fire ${reports.fire}, Pharm ${reports.pharmacy}, Bank ${reports.bank}, Market ${reports.market}, Mall ${reports.mall}, Transport ${reports.transport}`
     );
-  } else {
-    bullets.push(`Facilities: Not loaded yet`);
   }
 
-  const narrative: string[] = [];
-  narrative.push(
-    `This report summarizes an initial assessment using the selected coordinate, the selected zonal dataset entry (if any), and OpenStreetMap-based facility counts within the chosen radius.`
-  );
-
-  const bestUse =
-    match?.classification?.toUpperCase() === "CR"
-      ? "Commercial / corridor-oriented potential (subject to local policy)."
-      : match?.classification?.toUpperCase() === "RR"
-      ? "Residential-focused suitability with amenity checks (subject to local policy)."
-      : "General suitability; refine after confirming classification meaning/policy.";
-
-  const riskNotes = [
-    "Validate zonal record against official sources.",
-    "Geocoding may represent a general area; confirm parcel-level coordinates.",
-    "OSM facility counts depend on map completeness and may under/over-count.",
-  ];
-
-  const comparableZones = match
-    ? `Comparable zones: same municipality (${match.municipality}) and classification (${match.classification})—review nearby vicinities with similar zonal tiers.`
-    : "Comparable zones: choose a municipality and classification to compare.";
-
-  return { created, bullets, narrative, bestUse, riskNotes, comparableZones };
+  return {
+    created,
+    bullets,
+    narrative: [
+      "This report is generated from the selected map coordinate, the loaded province zonal dataset, and OpenStreetMap facility counts.",
+      "Use this as an initial assessment and validate with official sources before final decisions.",
+    ],
+    bestUse:
+      match?.classification?.toUpperCase() === "CR"
+        ? "Commercial / corridor-oriented potential (subject to local policy)."
+        : match?.classification?.toUpperCase() === "RR"
+        ? "Residential-focused suitability (subject to local policy)."
+        : "General suitability; confirm classification meaning/policy.",
+    riskNotes: [
+      "Validate zonal values with official records.",
+      "OSM facility counts depend on map completeness.",
+      "Geocoding may represent general area; confirm parcel-level coordinates.",
+    ],
+    comparableZones: match
+      ? `Compare within ${match.municipality} with classification ${match.classification}; check vicinities with similar tiers.`
+      : "Select a zonal record to enable comparisons.",
+  };
 }
 
 function ReportModal({
@@ -528,7 +582,6 @@ function ReportModal({
             <div className="text-sm font-semibold text-slate-900">{title}</div>
             <div className="mt-1 text-xs text-slate-500">Generated: {report.created}</div>
           </div>
-
           <div className="flex gap-2">
             <button
               type="button"
@@ -547,7 +600,7 @@ function ReportModal({
           </div>
         </div>
 
-        <div className="max-h-[70vh] overflow-auto px-5 py-4">
+        <div className="max-h-[70vh] overflow-auto px-5 py-4 space-y-4">
           <section className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
             <div className="text-sm font-semibold text-slate-900">Executive Summary</div>
             <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-black">
@@ -557,7 +610,7 @@ function ReportModal({
             </ul>
           </section>
 
-          <section className="mt-4 rounded-2xl border border-slate-200 bg-white p-4">
+          <section className="rounded-2xl border border-slate-200 bg-white p-4">
             <div className="text-sm font-semibold text-slate-900">Full Narrative</div>
             <div className="mt-2 space-y-2 text-sm leading-6 text-black">
               {report.narrative.map((p, i) => (
@@ -566,12 +619,11 @@ function ReportModal({
             </div>
           </section>
 
-          <section className="mt-4 grid gap-4 lg:grid-cols-2">
+          <section className="grid gap-4 lg:grid-cols-2">
             <div className="rounded-2xl border border-slate-200 bg-white p-4">
               <div className="text-sm font-semibold text-slate-900">Best Use</div>
               <div className="mt-2 text-sm leading-6 text-black">{report.bestUse}</div>
             </div>
-
             <div className="rounded-2xl border border-slate-200 bg-white p-4">
               <div className="text-sm font-semibold text-slate-900">Risk Notes</div>
               <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-black">
@@ -582,7 +634,7 @@ function ReportModal({
             </div>
           </section>
 
-          <section className="mt-4 rounded-2xl border border-slate-200 bg-white p-4">
+          <section className="rounded-2xl border border-slate-200 bg-white p-4">
             <div className="text-sm font-semibold text-slate-900">Comparable Zones</div>
             <div className="mt-2 text-sm text-black">{report.comparableZones}</div>
           </section>
@@ -592,7 +644,7 @@ function ReportModal({
   );
 }
 
-/* ---------------- Main page ---------------- */
+/* ---------------- Main ---------------- */
 
 const RADIUS_OPTIONS: Array<{ label: string; value: number }> = [
   { label: "500m", value: 500 },
@@ -603,8 +655,11 @@ const RADIUS_OPTIONS: Array<{ label: string; value: number }> = [
 ];
 
 export default function Page() {
+  const [manifest, setManifest] = useState<Manifest | null>(null);
+
   const [rows, setRows] = useState<Row[]>([]);
-  const [datasetLoading, setDatasetLoading] = useState(true);
+  const [activeProvinceKey, setActiveProvinceKey] = useState<string>("");
+  const [datasetLoading, setDatasetLoading] = useState<boolean>(true);
 
   const [q, setQ] = useState("");
   const [geo, setGeo] = useState<Geo | null>(null);
@@ -618,7 +673,7 @@ export default function Page() {
   const [fBarangay, setFBarangay] = useState("");
   const [fClass, setFClass] = useState("");
 
-  // record list filter + pagination
+  // record list query + pagination
   const [listQuery, setListQuery] = useState("");
   const [page, setPage] = useState(1);
   const PAGE_SIZE = 20;
@@ -638,44 +693,66 @@ export default function Page() {
   const lastActionRef = useRef<number>(0);
   const dragDebounceRef = useRef<any>(null);
 
-  // ✅ Auto-load ABRA dataset
+  // load manifest once
   useEffect(() => {
     (async () => {
       try {
         setDatasetLoading(true);
-        const res = await fetch("/zonal/ABRA.csv", { cache: "force-cache" });
-        if (!res.ok) throw new Error("Failed to load /zonal/ABRA.csv");
-        const text = await res.text();
-        const parsed = parseZonalFile(text);
-        if (!parsed.length) throw new Error("ABRA.csv loaded but 0 rows");
-        setRows(parsed);
-        setMatch(parsed[0] ?? null);
+        const m = await fetchManifest();
+        setManifest(m);
         setErr(null);
+
+        // optional: load the first manifest entry so UI has data immediately
+        const firstKey = Object.keys(m)[0];
+        if (firstKey) {
+          const r = await loadProvinceRows(m, firstKey);
+          setRows(r);
+          setActiveProvinceKey(firstKey);
+          setMatch(null);
+        }
       } catch (e: any) {
-        setErr(String(e?.message ?? "Failed to load dataset"));
+        setErr(String(e?.message ?? "Failed to load manifest"));
       } finally {
         setDatasetLoading(false);
       }
     })();
   }, []);
 
-  // reset cascades
+  // autocomplete debounce
+  useEffect(() => {
+    const text = q.trim();
+    if (!text || text.length < 3) {
+      setSuggestions([]);
+      return;
+    }
+    if (autoTimerRef.current) clearTimeout(autoTimerRef.current);
+    autoTimerRef.current = setTimeout(async () => {
+      try {
+        const res = await nominatimSearch(text, 5);
+        setSuggestions(res);
+      } catch {}
+    }, 350);
+
+    return () => {
+      if (autoTimerRef.current) clearTimeout(autoTimerRef.current);
+    };
+  }, [q]);
+
+  // reset cascades + page
   useEffect(() => {
     setFBarangay("");
     setFClass("");
     setPage(1);
   }, [fMunicipality]);
-
   useEffect(() => {
     setFClass("");
     setPage(1);
   }, [fBarangay]);
-
   useEffect(() => {
     setPage(1);
-  }, [fClass, listQuery]);
+  }, [fClass, listQuery, activeProvinceKey]);
 
-  // filter options
+  // filter options from current province rows
   const municipalityOptions = useMemo(() => {
     return Array.from(new Set(rows.map((r) => r.municipality))).sort();
   }, [rows]);
@@ -712,6 +789,7 @@ export default function Page() {
         );
         if (!hay.includes(q)) return false;
       }
+
       return true;
     });
   }, [rows, fMunicipality, fBarangay, fClass, listQuery]);
@@ -721,27 +799,6 @@ export default function Page() {
     const start = (page - 1) * PAGE_SIZE;
     return filteredRows.slice(start, start + PAGE_SIZE);
   }, [filteredRows, page]);
-
-  // autocomplete debounce
-  useEffect(() => {
-    const text = q.trim();
-    if (!text || text.length < 3) {
-      setSuggestions([]);
-      return;
-    }
-
-    if (autoTimerRef.current) clearTimeout(autoTimerRef.current);
-    autoTimerRef.current = setTimeout(async () => {
-      try {
-        const res = await nominatimSearch(text, 5);
-        setSuggestions(res);
-      } catch {}
-    }, 350);
-
-    return () => {
-      if (autoTimerRef.current) clearTimeout(autoTimerRef.current);
-    };
-  }, [q]);
 
   const centerTuple: LatLngTuple = geo ? [geo.lat, geo.lng] : [14.5995, 120.9842];
 
@@ -753,8 +810,44 @@ export default function Page() {
     return "Low";
   }, [topMatches]);
 
+  async function ensureProvinceDataset(g: Geo) {
+    if (!manifest) throw new Error("Manifest not loaded yet.");
+
+    const provinceName = detectProvinceName(g.address);
+    const key = normalizeProvinceKey(provinceName);
+
+    if (!key) throw new Error("Could not detect province from this location.");
+
+    // ✅ this is the critical line: key must exist in manifest
+    const path = manifest[key];
+    if (!path) {
+      throw new Error(
+        `No CSV mapped for detected province: "${provinceName}" -> key "${key}". Add it to manifest.json.`
+      );
+    }
+
+    if (key === activeProvinceKey && rows.length) return;
+
+    setDatasetLoading(true);
+    try {
+      const newRows = await loadProvinceRows(manifest, key);
+      setRows(newRows);
+      setActiveProvinceKey(key);
+      setMatch(null);
+
+      // reset filters when switching province
+      setFMunicipality("");
+      setFBarangay("");
+      setFClass("");
+      setListQuery("");
+      setPage(1);
+    } finally {
+      setDatasetLoading(false);
+    }
+  }
+
   async function updateMatching(queryText: string, g?: Geo) {
-    const base = filteredRows.length ? filteredRows : rows;
+    const base = rows;
     if (!base.length) {
       setTopMatches([]);
       setMatch(null);
@@ -764,7 +857,7 @@ export default function Page() {
     const hints = g
       ? {
           municipality: g.address?.city || g.address?.town || g.address?.municipality,
-          province: g.address?.state || g.address?.province,
+          province: detectProvinceName(g.address),
         }
       : undefined;
 
@@ -774,7 +867,8 @@ export default function Page() {
       .slice(0, 6);
 
     setTopMatches(scored);
-    setMatch(scored[0]?.row ?? null);
+    // do not force select; user can click records table
+    if (!match) setMatch(scored[0]?.row ?? null);
   }
 
   async function updateReports(lat: number, lng: number) {
@@ -784,6 +878,11 @@ export default function Page() {
 
   async function runFullPipeline(g: Geo, queryText: string) {
     setGeo(g);
+
+    // ✅ auto-switch province dataset here
+    await ensureProvinceDataset(g);
+
+    // update matching + reports
     await updateMatching(queryText, g);
     await updateReports(g.lat, g.lng);
   }
@@ -843,6 +942,7 @@ export default function Page() {
 
       setGeo({ displayName: "Pinned location (dragging)", lat, lng });
 
+      // live reports on drag
       setLoading(true);
       try {
         await updateReports(lat, lng);
@@ -852,11 +952,13 @@ export default function Page() {
         setLoading(false);
       }
 
+      // debounce reverse geocode + province switch
       if (dragDebounceRef.current) clearTimeout(dragDebounceRef.current);
       dragDebounceRef.current = setTimeout(async () => {
         setLoading(true);
         try {
           const g = await nominatimReverse(lat, lng);
+          setQ(g.displayName);
           await runFullPipeline(g, g.displayName);
         } catch (e: any) {
           setErr(String(e?.message ?? "Reverse geocoding failed"));
@@ -880,7 +982,7 @@ export default function Page() {
     }
   }
 
-  // radius changes -> refresh reports only
+  // radius changes => refresh reports only
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -907,6 +1009,7 @@ export default function Page() {
       reports,
       confidence,
       radius,
+      provinceKey: activeProvinceKey,
     });
     setReportData(rep);
     setReportOpen(true);
@@ -917,15 +1020,15 @@ export default function Page() {
   return (
     <main className="min-h-screen bg-slate-50">
       <div className="mx-auto max-w-7xl px-4 py-8">
-        {/* Header */}
         <div className="flex flex-col gap-4">
           <div>
-            <h1 className="text-2xl font-semibold text-slate-900">ABRA Zonal Finder</h1>
+            <h1 className="text-2xl font-semibold text-slate-900">PH Zonal Finder</h1>
             <p className="mt-1 text-sm text-slate-600">
-              Select municipality to see all records • Search map for reports
+              Search / click map → auto loads the correct province CSV from <code>/public/zonal</code>
             </p>
             <div className="mt-2 text-xs text-slate-500">
-              Dataset: {datasetLoading ? "Loading ABRA.csv…" : `${rows.length} rows loaded`}
+              Manifest: {manifest ? "loaded" : "loading…"} • Active dataset:{" "}
+              {datasetLoading ? "loading…" : activeProvinceKey ? `${activeProvinceKey} (${rows.length} rows)` : "none"}
             </div>
           </div>
 
@@ -939,11 +1042,11 @@ export default function Page() {
                   setShowSug(true);
                 }}
                 onFocus={() => setShowSug(true)}
-                placeholder="Search place (Nominatim)…"
+                placeholder="Search place (e.g., Laoag City, Ilocos Norte)…"
                 className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-black placeholder:text-slate-400 outline-none focus:border-slate-400 focus:ring-4 focus:ring-slate-200"
               />
               <button
-                disabled={loading}
+                disabled={loading || !manifest}
                 className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-medium text-white shadow-sm transition hover:bg-slate-800 disabled:opacity-60"
                 type="submit"
               >
@@ -997,9 +1100,7 @@ export default function Page() {
                 >
                   <option value="">All</option>
                   {municipalityOptions.map((m) => (
-                    <option key={m} value={m}>
-                      {m}
-                    </option>
+                    <option key={m} value={m}>{m}</option>
                   ))}
                 </select>
               </div>
@@ -1013,9 +1114,7 @@ export default function Page() {
                 >
                   <option value="">All</option>
                   {barangayOptions.map((b) => (
-                    <option key={b} value={b}>
-                      {b}
-                    </option>
+                    <option key={b} value={b}>{b}</option>
                   ))}
                 </select>
               </div>
@@ -1029,9 +1128,7 @@ export default function Page() {
                 >
                   <option value="">All</option>
                   {classOptions.map((c) => (
-                    <option key={c} value={c}>
-                      {c}
-                    </option>
+                    <option key={c} value={c}>{c}</option>
                   ))}
                 </select>
               </div>
@@ -1061,6 +1158,7 @@ export default function Page() {
                   <div className="mt-2 text-xs text-slate-500">Confidence: {confidence}</div>
 
                   <div className="mt-3 space-y-1">
+                    <div><span className="text-slate-500">Province:</span> {match.province}</div>
                     <div><span className="text-slate-500">Municipality:</span> {match.municipality}</div>
                     <div><span className="text-slate-500">Barangay:</span> {match.barangay}</div>
                     <div><span className="text-slate-500">Street:</span> {match.street}</div>
@@ -1069,7 +1167,9 @@ export default function Page() {
                   </div>
                 </>
               ) : (
-                <div className="text-sm text-slate-500">Select a row from “Records” below.</div>
+                <div className="text-sm text-slate-500">
+                  Click any row in “Records” to select.
+                </div>
               )}
 
               <button
@@ -1085,91 +1185,93 @@ export default function Page() {
               </button>
             </Card>
 
-            <Card title="Records (ABRA dataset)">
-              <div className="flex flex-col gap-2">
-                <input
-                  value={listQuery}
-                  onChange={(e) => setListQuery(e.target.value)}
-                  placeholder="Filter records (barangay/vicinity/class)…"
-                  className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-black placeholder:text-slate-400"
-                />
+            <Card title="Records (current province dataset)">
+              <input
+                value={listQuery}
+                onChange={(e) => setListQuery(e.target.value)}
+                placeholder="Filter records (barangay/vicinity/class)…"
+                className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-black placeholder:text-slate-400"
+              />
 
-                <div className="text-xs text-slate-500">
-                  Showing <b>{filteredRows.length}</b> records (Page {page} / {totalPages})
-                </div>
+              <div className="mt-2 text-xs text-slate-500">
+                Showing <b>{filteredRows.length}</b> records • Page {page} / {totalPages}
+              </div>
 
-                <div className="overflow-hidden rounded-xl border border-slate-200">
-                  <div className="max-h-[45vh] overflow-auto">
-                    <table className="w-full text-left text-sm">
-                      <thead className="sticky top-0 bg-slate-50 text-xs text-slate-600">
-                        <tr>
-                          <th className="px-3 py-2">Barangay</th>
-                          <th className="px-3 py-2">Vicinity</th>
-                          <th className="px-3 py-2">Class</th>
-                          <th className="px-3 py-2">Zonal</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {pagedRows.map((r, i) => {
-                          const active = match === r;
-                          return (
-                            <tr
-                              key={`${r.municipality}-${r.barangay}-${r.vicinity}-${r.classification}-${i}`}
-                              className={clsx(
-                                "cursor-pointer border-t border-slate-100 hover:bg-slate-50",
-                                active && "bg-slate-100"
-                              )}
-                              onClick={() => setMatch(r)}
-                            >
-                              <td className="px-3 py-2 text-black">{r.barangay}</td>
-                              <td className="px-3 py-2 text-black">{r.vicinity}</td>
-                              <td className="px-3 py-2 text-black">{r.classification}</td>
-                              <td className="px-3 py-2 text-black">₱ {money(r.zonalValue)}</td>
-                            </tr>
-                          );
-                        })}
-                        {!pagedRows.length ? (
-                          <tr>
-                            <td colSpan={4} className="px-3 py-6 text-center text-slate-500">
-                              No records match your filters.
-                            </td>
+              <div className="mt-2 overflow-hidden rounded-xl border border-slate-200">
+                <div className="max-h-[45vh] overflow-auto">
+                  <table className="w-full text-left text-sm">
+                    <thead className="sticky top-0 bg-slate-50 text-xs text-slate-600">
+                      <tr>
+                        <th className="px-3 py-2">Municipality</th>
+                        <th className="px-3 py-2">Barangay</th>
+                        <th className="px-3 py-2">Vicinity</th>
+                        <th className="px-3 py-2">Class</th>
+                        <th className="px-3 py-2">Zonal</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {pagedRows.map((r, i) => {
+                        const active = match === r;
+                        return (
+                          <tr
+                            key={`${r.municipality}-${r.barangay}-${r.vicinity}-${r.classification}-${i}`}
+                            className={clsx(
+                              "cursor-pointer border-t border-slate-100 hover:bg-slate-50",
+                              active && "bg-slate-100"
+                            )}
+                            onClick={() => setMatch(r)}
+                          >
+                            <td className="px-3 py-2 text-black">{r.municipality}</td>
+                            <td className="px-3 py-2 text-black">{r.barangay}</td>
+                            <td className="px-3 py-2 text-black">{r.vicinity}</td>
+                            <td className="px-3 py-2 text-black">{r.classification}</td>
+                            <td className="px-3 py-2 text-black">₱ {money(r.zonalValue)}</td>
                           </tr>
-                        ) : null}
-                      </tbody>
-                    </table>
-                  </div>
+                        );
+                      })}
+                      {!pagedRows.length ? (
+                        <tr>
+                          <td colSpan={5} className="px-3 py-6 text-center text-slate-500">
+                            No records match your filters.
+                          </td>
+                        </tr>
+                      ) : null}
+                    </tbody>
+                  </table>
                 </div>
+              </div>
 
-                <div className="flex items-center justify-between gap-2">
-                  <button
-                    type="button"
-                    className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm hover:bg-slate-50 disabled:opacity-50"
-                    onClick={() => setPage((p) => Math.max(1, p - 1))}
-                    disabled={page <= 1}
-                  >
-                    Prev
-                  </button>
-
-                  <div className="text-xs text-slate-500">
-                    Page {page} of {totalPages}
-                  </div>
-
-                  <button
-                    type="button"
-                    className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm hover:bg-slate-50 disabled:opacity-50"
-                    onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
-                    disabled={page >= totalPages}
-                  >
-                    Next
-                  </button>
+              <div className="mt-2 flex items-center justify-between gap-2">
+                <button
+                  type="button"
+                  className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm hover:bg-slate-50 disabled:opacity-50"
+                  onClick={() => setPage((p) => Math.max(1, p - 1))}
+                  disabled={page <= 1}
+                >
+                  Prev
+                </button>
+                <div className="text-xs text-slate-500">
+                  Page {page} of {totalPages}
                 </div>
+                <button
+                  type="button"
+                  className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm hover:bg-slate-50 disabled:opacity-50"
+                  onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                  disabled={page >= totalPages}
+                >
+                  Next
+                </button>
               </div>
             </Card>
           </div>
 
           {/* Middle */}
           <div className="col-span-12 lg:col-span-5">
-            <MapPanel center={centerTuple} label={geo?.displayName ?? "Click map or search"} onPick={onMapPick} />
+            <MapPanel
+              center={centerTuple}
+              label={geo?.displayName ?? "Click map or search"}
+              onPick={onMapPick}
+            />
             <div className="mt-2 text-xs text-slate-500">
               {geo ? (
                 <>
@@ -1197,11 +1299,11 @@ export default function Page() {
                 <Metric label="Transport" value={reports?.transport ?? (loading ? "…" : "—")} />
               </div>
               <div className="mt-3 text-xs text-slate-500">
-                Reports use OpenStreetMap (ODbL) via Overpass. Avoid rapid repeated dragging.
+                Reports use OpenStreetMap (ODbL) via Overpass. Avoid rapid repeated dragging/searching.
               </div>
             </Card>
 
-            <Card title="Top Matches (from map search)">
+            <Card title="Top Matches (quick picks)">
               {topMatches.length ? (
                 <div className="space-y-2">
                   {topMatches.map((m, i) => (
