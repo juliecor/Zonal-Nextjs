@@ -4,5 +4,8 @@
   "BAGUIOCITY": "/zonal/BAGUIOCITY.csv",
   "MOUNTAIN": "/zonal/BONTOCMTPROVINCE.csv",
   "BENGUET": "/zonal/LATRINIDADBENGUET.csv",
-  "KALINGA": "/zonal/TABUKCITYKALINGA.csv"
+  "KALINGA": "/zonal/TABUKCITYKALINGA.csv",
+  "IFUGAO": "/zonal/LAGAWEIFUGAO.csv",
+  "TARLAC": "/zonal/PANIQUETARLAC.csv",
+  "TARLACCITY": "/zonal/TARLACCITY.csv"
 }

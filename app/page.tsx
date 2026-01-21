@@ -163,7 +163,7 @@ function normalizeKey(s?: string | null) {
 
 const CITY_OVERRIDES: Record<string, string> = {
   BAGUIO: "BAGUIOCITY",
-  
+  TARLACCITY: "TARLACCITY",
   // add more if you want:
   // QUEZONCITY: "QUEZONCITY",
 };
