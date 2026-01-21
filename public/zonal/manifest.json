@@ -1,4 +1,8 @@
 {
   "ABRA": "/zonal/ABRA.csv",
-  "ILOCOSNORTE": "/zonal/ILOCOSNORTE.csv"
+  "ILOCOSNORTE": "/zonal/ILOCOSNORTE.csv",
+  "BAGUIOCITY": "/zonal/BAGUIOCITY.csv",
+  "MOUNTAIN": "/zonal/BONTOCMTPROVINCE.csv",
+  "BENGUET": "/zonal/LATRINIDADBENGUET.csv",
+  "KALINGA": "/zonal/TABUKCITYKALINGA.csv"
 }

@@ -46,7 +46,7 @@ type Reports = {
 
 type Manifest = Record<string, string>;
 
-/* ---------------- helpers ---------------- */
+/* ---------------- utils ---------------- */
 
 function clsx(...parts: Array<string | false | null | undefined>) {
   return parts.filter(Boolean).join(" ");
@@ -78,7 +78,7 @@ function money(n: number) {
   });
 }
 
-/** Parses both CSV and TSV, supports header or no header */
+/** Supports CSV or TSV, with or without header row */
 function parseZonalFile(text: string): Row[] {
   const lines = text
     .replace(/\r/g, "")
@@ -93,13 +93,15 @@ function parseZonalFile(text: string): Row[] {
   const splitLine = (line: string) => {
     if (delimiter === "\t") return line.split("\t").map((s) => s.trim());
 
-    // CSV with quotes
+    // CSV w/ quotes
     const out: string[] = [];
     let cur = "";
     let inQuotes = false;
+
     for (let i = 0; i < line.length; i++) {
       const ch = line[i];
       if (ch === '"') inQuotes = !inQuotes;
+
       if (ch === "," && !inQuotes) {
         out.push(cur);
         cur = "";
@@ -147,81 +149,51 @@ function parseZonalFile(text: string): Row[] {
   });
 }
 
-function tokenSet(s: string) {
-  return new Set(norm(s).split(" ").filter((t) => t.length >= 3));
+/* ---------------- dataset key detection (BAGUIO override) ---------------- */
+
+function normalizeKey(s?: string | null) {
+  if (!s) return "";
+  return String(s)
+    .trim()
+    .replace(/\bprovince\b/gi, "")
+    .replace(/\bprovincia\b/gi, "")
+    .replace(/[\s._-]+/g, "") // remove spaces + separators
+    .toUpperCase();
 }
 
-function scoreRow(row: Row, queryText: string, hints?: { province?: string; municipality?: string }) {
-  const q = norm(queryText);
-  if (!q) return 0;
-  const qTokens = tokenSet(q);
+const CITY_OVERRIDES: Record<string, string> = {
+  BAGUIO: "BAGUIOCITY",
+  
+  // add more if you want:
+  // QUEZONCITY: "QUEZONCITY",
+};
 
-  const field = (label: string, weight: number) => {
-    const f = norm(label);
-    if (!f) return 0;
-
-    let score = 0;
-    if (f === q) score += 120 * weight;
-    if (f.includes(q)) score += 55 * weight;
-
-    const fTokens = tokenSet(f);
-    let intersect = 0;
-    for (const t of qTokens) if (fTokens.has(t)) intersect++;
-    score += intersect * 6 * weight;
-    return score;
-  };
-
-  let s =
-    field(row.vicinity, 6) +
-    field(row.street, 4) +
-    field(row.barangay, 3) +
-    field(row.municipality, 2) +
-    field(row.province, 2) +
-    field(row.classification, 1);
-
-  if (hints?.province && norm(row.province) === norm(hints.province)) s += 80;
-  if (hints?.municipality && norm(row.municipality) === norm(hints.municipality)) s += 80;
-
-  return s;
-}
-
-/* ---------------- Province detection + normalization ---------------- */
-
-/**
- * Nominatim PH can put "province" into different fields depending on the place.
- * We try multiple candidates.
- */
-function detectProvinceName(address: any): string {
+  function detectCityName(address: any): string {
   if (!address) return "";
   return (
-    address.province ||
-    address.state ||        // sometimes province appears here
-    address.county ||
-    address.region ||
+    address.city ||
+    address.town ||
+    address.municipality ||
+    address.city_district ||
+    address.suburb ||
     ""
   );
 }
 
-/**
- * This MUST match your manifest keys:
- * - removes "Province/Provincia"
- * - removes spaces and punctuation
- * - uppercase
- *
- * "Ilocos Norte Province" -> "ILOCOSNORTE"
- * "Ilocos Norte" -> "ILOCOSNORTE"
- */
-function normalizeProvinceKey(p?: string | null) {
-  if (!p) return "";
-  return String(p)
-    .trim()
-    .replace(/\bprovince\b/gi, "")
-    .replace(/\bprovincia\b/gi, "")
-    .replace(/[\s._-]+/g, "") // remove spaces + common separators
-    .toUpperCase();
+function detectProvinceName(address: any): string {
+  if (!address) return "";
+  return address.province || address.state || address.county || address.region || "";
 }
 
-/* ---------------- Nominatim ---------------- */
+function detectDatasetKey(address: any) {
+  const cityKey = normalizeKey(detectCityName(address));
+  if (CITY_OVERRIDES[cityKey]) return CITY_OVERRIDES[cityKey];
+
+  const provKey = normalizeKey(detectProvinceName(address));
+  return provKey;
+}
+
+/* ---------------- nominatim ---------------- */
 
 async function nominatimSearch(q: string, limit = 5): Promise<NominatimSuggestion[]> {
   const url = `https://nominatim.openstreetmap.org/search?format=jsonv2&addressdetails=1&limit=${limit}&q=${encodeURIComponent(
@@ -259,22 +231,22 @@ async function nominatimReverse(lat: number, lng: number): Promise<Geo> {
   };
 }
 
-/* ---------------- Manifest + dataset loader ---------------- */
+/* ---------------- manifest + dataset loader ---------------- */
 
 async function fetchManifest(): Promise<Manifest> {
+  // ✅ no-store avoids the dev caching issue you hit
   const res = await fetch("/zonal/manifest.json", { cache: "no-store" });
   if (!res.ok) throw new Error("Failed to load /zonal/manifest.json");
   return (await res.json()) as Manifest;
 }
 
-
 const datasetCache = new Map<string, Row[]>();
 
-async function loadProvinceRows(manifest: Manifest, provinceKey: string): Promise<Row[]> {
-  if (datasetCache.has(provinceKey)) return datasetCache.get(provinceKey)!;
+async function loadRows(manifest: Manifest, key: string): Promise<Row[]> {
+  if (datasetCache.has(key)) return datasetCache.get(key)!;
 
-  const path = manifest[provinceKey];
-  if (!path) throw new Error(`No CSV mapped for province key: ${provinceKey}`);
+  const path = manifest[key];
+  if (!path) throw new Error(`No CSV mapped for key: ${key}`);
 
   const res = await fetch(path, { cache: "force-cache" });
   if (!res.ok) throw new Error(`Failed to load CSV: ${path}`);
@@ -283,11 +255,11 @@ async function loadProvinceRows(manifest: Manifest, provinceKey: string): Promis
   const rows = parseZonalFile(text);
   if (!rows.length) throw new Error(`Loaded ${path} but got 0 rows`);
 
-  datasetCache.set(provinceKey, rows);
+  datasetCache.set(key, rows);
   return rows;
 }
 
-/* ---------------- Overpass (kept minimal; you already know rate limit can happen) ---------------- */
+/* ---------------- overpass reports (with fallback endpoints) ---------------- */
 
 const OVERPASS_ENDPOINTS = [
   "https://overpass-api.de/api/interpreter",
@@ -308,12 +280,12 @@ async function postOverpass(endpoint: string, query: string) {
   });
 
   const text = await res.text();
-  if (!res.ok) throw new Error(`Overpass error (${res.status}): ${text.slice(0, 200)}`);
+  if (!res.ok) throw new Error(`Overpass error (${res.status}): ${text.slice(0, 220)}`);
 
   try {
     return JSON.parse(text) as { elements?: Array<{ type: string; id: number; tags?: Record<string, string> }> };
   } catch {
-    throw new Error(`Overpass returned non-JSON: ${text.slice(0, 200)}`);
+    throw new Error(`Overpass returned non-JSON: ${text.slice(0, 220)}`);
   }
 }
 
@@ -330,7 +302,7 @@ async function overpassWithFallback(query: string) {
   throw lastErr ?? new Error("Overpass failed");
 }
 
-function dedupeElements(els: Array<{ type: string; id: number; tags?: Record<string, string> }>) {
+function dedupeElements(els: Array<{ type: string; id: number }>) {
   const seen = new Set<string>();
   const out: typeof els = [];
   for (const e of els) {
@@ -354,11 +326,13 @@ async function fetchReports(lat: number, lng: number, radius: number): Promise<R
 nwr["amenity"~"^(hospital|school|police|fire_station|pharmacy|bank|marketplace)$"](around:${radius},${lat},${lng});
 out tags;
 `;
+
   const mallQuery = `
 [out:json][timeout:25];
 nwr["shop"="mall"](around:${radius},${lat},${lng});
 out tags;
 `;
+
   const transportQuery = `
 [out:json][timeout:25];
 (
@@ -391,7 +365,7 @@ out tags;
   }
 
   const mall = (mallJson.elements ?? []).length;
-  const transport = dedupeElements(transportJson.elements ?? []).length;
+  const transport = dedupeElements((transportJson.elements ?? []).map((e) => ({ type: e.type, id: e.id }))).length;
 
   const final: Reports = {
     hospitals: counts.hospital,
@@ -409,7 +383,47 @@ out tags;
   return final;
 }
 
-/* ---------------- UI components ---------------- */
+/* ---------------- matching (lightweight) ---------------- */
+
+function tokenSet(s: string) {
+  return new Set(norm(s).split(" ").filter((t) => t.length >= 3));
+}
+
+function scoreRow(row: Row, queryText: string, hints?: { municipality?: string; province?: string }) {
+  const q = norm(queryText);
+  if (!q) return 0;
+  const qTokens = tokenSet(q);
+
+  const field = (label: string, weight: number) => {
+    const f = norm(label);
+    if (!f) return 0;
+
+    let score = 0;
+    if (f === q) score += 120 * weight;
+    if (f.includes(q)) score += 55 * weight;
+
+    const fTokens = tokenSet(f);
+    let intersect = 0;
+    for (const t of qTokens) if (fTokens.has(t)) intersect++;
+    score += intersect * 6 * weight;
+    return score;
+  };
+
+  let s =
+    field(row.vicinity, 6) +
+    field(row.street, 4) +
+    field(row.barangay, 3) +
+    field(row.municipality, 2) +
+    field(row.province, 2) +
+    field(row.classification, 1);
+
+  if (hints?.province && norm(row.province) === norm(hints.province)) s += 80;
+  if (hints?.municipality && norm(row.municipality) === norm(hints.municipality)) s += 80;
+
+  return s;
+}
+
+/* ---------------- UI bits ---------------- */
 
 function Card({ title, children }: { title: string; children: React.ReactNode }) {
   return (
@@ -429,7 +443,7 @@ function Metric({ label, value }: { label: string; value: number | string }) {
   );
 }
 
-/* ---------------- Printable report modal (simple) ---------------- */
+/* ---------------- printable report modal ---------------- */
 
 function tier(z: number) {
   if (!Number.isFinite(z) || z <= 0) return "Unknown";
@@ -447,15 +461,15 @@ function makeReport(args: {
   reports: Reports | null;
   confidence: "High" | "Medium" | "Low" | "—";
   radius: number;
-  provinceKey: string;
+  datasetKey: string;
 }) {
-  const { placeName, lat, lng, match, reports, confidence, radius, provinceKey } = args;
+  const { placeName, lat, lng, match, reports, confidence, radius, datasetKey } = args;
   const created = new Date().toLocaleString();
 
   const bullets: string[] = [];
   bullets.push(`Location: ${placeName}`);
   bullets.push(`Coordinates: ${lat.toFixed(6)}, ${lng.toFixed(6)}`);
-  bullets.push(`Province dataset loaded: ${provinceKey || "—"}`);
+  bullets.push(`Dataset loaded: ${datasetKey || "—"}`);
   bullets.push(`Radius used for counts: ${Math.round(radius)}m`);
 
   if (match) {
@@ -478,8 +492,8 @@ function makeReport(args: {
     created,
     bullets,
     narrative: [
-      "This report is generated from the selected map coordinate, the loaded province zonal dataset, and OpenStreetMap facility counts.",
-      "Use this as an initial assessment and validate with official sources before final decisions.",
+      "This report is generated from the selected map coordinate, the loaded dataset (province/city), and OpenStreetMap facility counts.",
+      "Use this as an initial assessment and validate with official records before final decisions.",
     ],
     bestUse:
       match?.classification?.toUpperCase() === "CR"
@@ -658,7 +672,7 @@ export default function Page() {
   const [manifest, setManifest] = useState<Manifest | null>(null);
 
   const [rows, setRows] = useState<Row[]>([]);
-  const [activeProvinceKey, setActiveProvinceKey] = useState<string>("");
+  const [activeKey, setActiveKey] = useState<string>("");
   const [datasetLoading, setDatasetLoading] = useState<boolean>(true);
 
   const [q, setQ] = useState("");
@@ -668,12 +682,12 @@ export default function Page() {
   const [showSug, setShowSug] = useState(false);
   const autoTimerRef = useRef<any>(null);
 
-  // dataset filters
+  // Filters
   const [fMunicipality, setFMunicipality] = useState("");
   const [fBarangay, setFBarangay] = useState("");
   const [fClass, setFClass] = useState("");
 
-  // record list query + pagination
+  // Record search + pagination
   const [listQuery, setListQuery] = useState("");
   const [page, setPage] = useState(1);
   const PAGE_SIZE = 20;
@@ -702,12 +716,12 @@ export default function Page() {
         setManifest(m);
         setErr(null);
 
-        // optional: load the first manifest entry so UI has data immediately
+        // load first dataset so UI isn't empty
         const firstKey = Object.keys(m)[0];
         if (firstKey) {
-          const r = await loadProvinceRows(m, firstKey);
+          const r = await loadRows(m, firstKey);
           setRows(r);
-          setActiveProvinceKey(firstKey);
+          setActiveKey(firstKey);
           setMatch(null);
         }
       } catch (e: any) {
@@ -738,21 +752,23 @@ export default function Page() {
     };
   }, [q]);
 
-  // reset cascades + page
+  // reset cascades + paging
   useEffect(() => {
     setFBarangay("");
     setFClass("");
     setPage(1);
   }, [fMunicipality]);
+
   useEffect(() => {
     setFClass("");
     setPage(1);
   }, [fBarangay]);
+
   useEffect(() => {
     setPage(1);
-  }, [fClass, listQuery, activeProvinceKey]);
+  }, [fClass, listQuery, activeKey]);
 
-  // filter options from current province rows
+  // options from current dataset
   const municipalityOptions = useMemo(() => {
     return Array.from(new Set(rows.map((r) => r.municipality))).sort();
   }, [rows]);
@@ -776,6 +792,7 @@ export default function Page() {
     return Array.from(set).sort();
   }, [rows, fMunicipality, fBarangay]);
 
+  // filtered list
   const filteredRows = useMemo(() => {
     return rows.filter((r) => {
       if (fMunicipality && norm(r.municipality) !== norm(fMunicipality)) return false;
@@ -789,7 +806,6 @@ export default function Page() {
         );
         if (!hay.includes(q)) return false;
       }
-
       return true;
     });
   }, [rows, fMunicipality, fBarangay, fClass, listQuery]);
@@ -810,32 +826,32 @@ export default function Page() {
     return "Low";
   }, [topMatches]);
 
-  async function ensureProvinceDataset(g: Geo) {
+  async function ensureDataset(g: Geo) {
     if (!manifest) throw new Error("Manifest not loaded yet.");
 
-    const provinceName = detectProvinceName(g.address);
-    const key = normalizeProvinceKey(provinceName);
+    const key = detectDatasetKey(g.address);
+    if (!key) throw new Error("Could not detect province/city from this location.");
 
-    if (!key) throw new Error("Could not detect province from this location.");
-
-    // ✅ this is the critical line: key must exist in manifest
     const path = manifest[key];
     if (!path) {
+      const city = detectCityName(g.address);
+      const prov = detectProvinceName(g.address);
       throw new Error(
-        `No CSV mapped for detected province: "${provinceName}" -> key "${key}". Add it to manifest.json.`
+        `No CSV mapped for detected area. city="${city}" province="${prov}" -> key="${key}". Add it to manifest.json.`
       );
     }
 
-    if (key === activeProvinceKey && rows.length) return;
+    if (key === activeKey && rows.length) return;
 
     setDatasetLoading(true);
     try {
-      const newRows = await loadProvinceRows(manifest, key);
+      const newRows = await loadRows(manifest, key);
       setRows(newRows);
-      setActiveProvinceKey(key);
+      setActiveKey(key);
       setMatch(null);
+      setTopMatches([]);
 
-      // reset filters when switching province
+      // reset filters on dataset switch
       setFMunicipality("");
       setFBarangay("");
       setFClass("");
@@ -847,8 +863,7 @@ export default function Page() {
   }
 
   async function updateMatching(queryText: string, g?: Geo) {
-    const base = rows;
-    if (!base.length) {
+    if (!rows.length) {
       setTopMatches([]);
       setMatch(null);
       return;
@@ -861,13 +876,12 @@ export default function Page() {
         }
       : undefined;
 
-    const scored = base
+    const scored = rows
       .map((r) => ({ row: r, score: scoreRow(r, queryText, hints) }))
       .sort((a, b) => b.score - a.score)
       .slice(0, 6);
 
     setTopMatches(scored);
-    // do not force select; user can click records table
     if (!match) setMatch(scored[0]?.row ?? null);
   }
 
@@ -878,11 +892,7 @@ export default function Page() {
 
   async function runFullPipeline(g: Geo, queryText: string) {
     setGeo(g);
-
-    // ✅ auto-switch province dataset here
-    await ensureProvinceDataset(g);
-
-    // update matching + reports
+    await ensureDataset(g);
     await updateMatching(queryText, g);
     await updateReports(g.lat, g.lng);
   }
@@ -942,7 +952,7 @@ export default function Page() {
 
       setGeo({ displayName: "Pinned location (dragging)", lat, lng });
 
-      // live reports on drag
+      // live reports while dragging
       setLoading(true);
       try {
         await updateReports(lat, lng);
@@ -952,7 +962,7 @@ export default function Page() {
         setLoading(false);
       }
 
-      // debounce reverse geocode + province switch
+      // debounce reverse geocode + dataset switch
       if (dragDebounceRef.current) clearTimeout(dragDebounceRef.current);
       dragDebounceRef.current = setTimeout(async () => {
         setLoading(true);
@@ -1009,7 +1019,7 @@ export default function Page() {
       reports,
       confidence,
       radius,
-      provinceKey: activeProvinceKey,
+      datasetKey: activeKey,
     });
     setReportData(rep);
     setReportOpen(true);
@@ -1024,11 +1034,11 @@ export default function Page() {
           <div>
             <h1 className="text-2xl font-semibold text-slate-900">PH Zonal Finder</h1>
             <p className="mt-1 text-sm text-slate-600">
-              Search / click map → auto loads the correct province CSV from <code>/public/zonal</code>
+              Search / click map → auto loads dataset from <code>/public/zonal</code> via manifest
             </p>
             <div className="mt-2 text-xs text-slate-500">
-              Manifest: {manifest ? "loaded" : "loading…"} • Active dataset:{" "}
-              {datasetLoading ? "loading…" : activeProvinceKey ? `${activeProvinceKey} (${rows.length} rows)` : "none"}
+              Active dataset:{" "}
+              {datasetLoading ? "loading…" : activeKey ? `${activeKey} (${rows.length} rows)` : "none"}
             </div>
           </div>
 
@@ -1042,7 +1052,7 @@ export default function Page() {
                   setShowSug(true);
                 }}
                 onFocus={() => setShowSug(true)}
-                placeholder="Search place (e.g., Laoag City, Ilocos Norte)…"
+                placeholder="Search place (e.g., Baguio City, Laoag City)…"
                 className="w-full rounded-xl border border-slate-300 bg-white px-3 py-2 text-sm text-black placeholder:text-slate-400 outline-none focus:border-slate-400 focus:ring-4 focus:ring-slate-200"
               />
               <button
@@ -1073,7 +1083,7 @@ export default function Page() {
             ) : null}
           </form>
 
-          {/* Controls */}
+          {/* Filters + Radius */}
           <div className="grid grid-cols-1 gap-3 lg:grid-cols-5">
             <div className="lg:col-span-1">
               <div className="text-xs font-semibold text-slate-600">Radius</div>
@@ -1100,7 +1110,9 @@ export default function Page() {
                 >
                   <option value="">All</option>
                   {municipalityOptions.map((m) => (
-                    <option key={m} value={m}>{m}</option>
+                    <option key={m} value={m}>
+                      {m}
+                    </option>
                   ))}
                 </select>
               </div>
@@ -1114,7 +1126,9 @@ export default function Page() {
                 >
                   <option value="">All</option>
                   {barangayOptions.map((b) => (
-                    <option key={b} value={b}>{b}</option>
+                    <option key={b} value={b}>
+                      {b}
+                    </option>
                   ))}
                 </select>
               </div>
@@ -1128,7 +1142,9 @@ export default function Page() {
                 >
                   <option value="">All</option>
                   {classOptions.map((c) => (
-                    <option key={c} value={c}>{c}</option>
+                    <option key={c} value={c}>
+                      {c}
+                    </option>
                   ))}
                 </select>
               </div>
@@ -1158,18 +1174,25 @@ export default function Page() {
                   <div className="mt-2 text-xs text-slate-500">Confidence: {confidence}</div>
 
                   <div className="mt-3 space-y-1">
-                    <div><span className="text-slate-500">Province:</span> {match.province}</div>
-                    <div><span className="text-slate-500">Municipality:</span> {match.municipality}</div>
-                    <div><span className="text-slate-500">Barangay:</span> {match.barangay}</div>
-                    <div><span className="text-slate-500">Street:</span> {match.street}</div>
-                    <div><span className="text-slate-500">Vicinity:</span> {match.vicinity}</div>
-                    <div><span className="text-slate-500">Class:</span> {match.classification}</div>
+                    <div>
+                      <span className="text-slate-500">Municipality:</span> {match.municipality}
+                    </div>
+                    <div>
+                      <span className="text-slate-500">Barangay:</span> {match.barangay}
+                    </div>
+                    <div>
+                      <span className="text-slate-500">Street:</span> {match.street}
+                    </div>
+                    <div>
+                      <span className="text-slate-500">Vicinity:</span> {match.vicinity}
+                    </div>
+                    <div>
+                      <span className="text-slate-500">Class:</span> {match.classification}
+                    </div>
                   </div>
                 </>
               ) : (
-                <div className="text-sm text-slate-500">
-                  Click any row in “Records” to select.
-                </div>
+                <div className="text-sm text-slate-500">Click a row in “Records” to select.</div>
               )}
 
               <button
@@ -1181,11 +1204,11 @@ export default function Page() {
                   geo ? "bg-slate-900 text-white hover:bg-slate-800" : "bg-slate-200 text-slate-500 cursor-not-allowed"
                 )}
               >
-                Generate Printable Report (needs map location)
+                Generate Printable Report
               </button>
             </Card>
 
-            <Card title="Records (current province dataset)">
+            <Card title="Records">
               <input
                 value={listQuery}
                 onChange={(e) => setListQuery(e.target.value)}
@@ -1267,11 +1290,7 @@ export default function Page() {
 
           {/* Middle */}
           <div className="col-span-12 lg:col-span-5">
-            <MapPanel
-              center={centerTuple}
-              label={geo?.displayName ?? "Click map or search"}
-              onPick={onMapPick}
-            />
+            <MapPanel center={centerTuple} label={geo?.displayName ?? "Click map or search"} onPick={onMapPick} />
             <div className="mt-2 text-xs text-slate-500">
               {geo ? (
                 <>
@@ -1299,7 +1318,7 @@ export default function Page() {
                 <Metric label="Transport" value={reports?.transport ?? (loading ? "…" : "—")} />
               </div>
               <div className="mt-3 text-xs text-slate-500">
-                Reports use OpenStreetMap (ODbL) via Overpass. Avoid rapid repeated dragging/searching.
+                Uses OpenStreetMap (ODbL) via Overpass. Rate limits can happen.
               </div>
             </Card>
 
@@ -1313,9 +1332,7 @@ export default function Page() {
                       onClick={() => setMatch(m.row)}
                       className={clsx(
                         "w-full rounded-xl border px-3 py-2 text-left text-sm shadow-sm transition",
-                        match === m.row
-                          ? "border-slate-400 bg-slate-50"
-                          : "border-slate-200 bg-white hover:bg-slate-50"
+                        match === m.row ? "border-slate-400 bg-slate-50" : "border-slate-200 bg-white hover:bg-slate-50"
                       )}
                     >
                       <div className="font-medium text-slate-900 line-clamp-1">{m.row.vicinity}</div>
@@ -1333,12 +1350,7 @@ export default function Page() {
         </div>
       </div>
 
-      <ReportModal
-        open={reportOpen}
-        onClose={() => setReportOpen(false)}
-        title="Printable Place Assessment Report"
-        report={reportData}
-      />
+      <ReportModal open={reportOpen} onClose={() => setReportOpen(false)} title="Printable Place Assessment Report" report={reportData} />
     </main>
   );
 }
