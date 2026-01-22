@@ -7,5 +7,6 @@
   "KALINGA": "/zonal/TABUKCITYKALINGA.csv",
   "IFUGAO": "/zonal/LAGAWEIFUGAO.csv",
   "TARLAC": "/zonal/PANIQUETARLAC.csv",
-  "TARLACCITY": "/zonal/TARLACCITY.csv"
+  "TARLACCITY": "/zonal/TARLACCITY.csv",
+  "CENTRALVISAYAS": "/zonal/CEBUCITYSOUTH.csv"
 }
